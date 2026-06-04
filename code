@@ -1,0 +1,208 @@
+# ======================================
+# 1. Setup
+# ======================================
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.applications import Xception
+import numpy as np
+import pandas as pd
+from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
+
+IMG_SIZE = (128, 128)
+BATCH_SIZE = 4
+EPOCHS = 3
+AUTOTUNE = tf.data.AUTOTUNE
+
+# ======================================
+# 2. Main Class
+# ======================================
+class RiceDiseaseDetector:
+
+    def __init__(self):
+        self.models = {}
+        self.num_classes = None
+        self.class_names = None
+
+    # ======================================
+    # Dataset
+    # ======================================
+    def load_dataset(self):
+
+        dataset_path = "/content/drive/MyDrive/dataset"
+
+        train_ds = tf.keras.utils.image_dataset_from_directory(
+            dataset_path,
+            validation_split=0.2,
+            subset="training",
+            seed=42,
+            image_size=IMG_SIZE,
+            batch_size=BATCH_SIZE
+        )
+
+        val_ds = tf.keras.utils.image_dataset_from_directory(
+            dataset_path,
+            validation_split=0.2,
+            subset="validation",
+            seed=42,
+            image_size=IMG_SIZE,
+            batch_size=BATCH_SIZE
+        )
+
+        self.class_names = train_ds.class_names
+        self.num_classes = len(self.class_names)
+
+        train_ds = train_ds.map(lambda x,y:(x/255.0, tf.one_hot(y,self.num_classes)))
+        val_ds = val_ds.map(lambda x,y:(x/255.0, tf.one_hot(y,self.num_classes)))
+
+        return train_ds.prefetch(AUTOTUNE), val_ds.prefetch(AUTOTUNE)
+
+    # ======================================
+    # CBAM BLOCK (FIXED)
+    # ======================================
+    def cbam_block(self, input_feature, ratio=8):
+
+    # ✅ FIX: get channel safely
+      channel = int(input_feature.shape[-1]) if input_feature.shape[-1] is not None else 1
+
+      # ✅ FIX: avoid zero units
+      reduced_channel = max(channel // ratio, 1)
+
+      # ----- Channel Attention -----
+      avg_pool = layers.GlobalAveragePooling2D()(input_feature)
+      max_pool = layers.GlobalMaxPooling2D()(input_feature)
+
+      dense1 = layers.Dense(reduced_channel, activation='relu')
+      dense2 = layers.Dense(channel)
+
+      avg_out = dense2(dense1(avg_pool))
+      max_out = dense2(dense1(max_pool))
+
+      channel_attention = layers.Add()([avg_out, max_out])
+      channel_attention = layers.Activation('sigmoid')(channel_attention)
+      channel_attention = layers.Reshape((1, 1, channel))(channel_attention)
+
+      x = layers.Multiply()([input_feature, channel_attention])
+
+      # ----- Spatial Attention -----
+      avg_pool = layers.Lambda(lambda x: tf.reduce_mean(x, axis=-1, keepdims=True))(x)
+      max_pool = layers.Lambda(lambda x: tf.reduce_max(x, axis=-1, keepdims=True))(x)
+
+      concat = layers.Concatenate(axis=-1)([avg_pool, max_pool])
+
+      spatial_attention = layers.Conv2D(1, 7, padding='same', activation='sigmoid')(concat)
+
+      output = layers.Multiply()([x, spatial_attention])
+
+      return output
+
+    # ======================================
+    # 🔥 Hybrid Model (SAFE VERSION)
+    # ======================================
+    def build_model(self):
+
+        input_tensor = layers.Input(shape=(*IMG_SIZE, 3))
+
+        # -------- CNN Branch --------
+        cnn = layers.Conv2D(64, 3, activation='relu', padding='same')(input_tensor)
+        cnn = layers.MaxPooling2D()(cnn)
+        cnn = layers.Conv2D(128, 3, activation='relu', padding='same')(cnn)
+        cnn = layers.GlobalAveragePooling2D()(cnn)
+        cnn = layers.Dense(128, activation='relu')(cnn)
+
+        # -------- Xception Branch --------
+        xcp_base = Xception(include_top=False, weights='imagenet',
+                            input_tensor=input_tensor, pooling='avg')
+        xcp = layers.Dense(128, activation='relu')(xcp_base.output)
+
+        # ======================================
+        # 🔥 Attention Fusion (SAFE)
+        # ======================================
+        concat = layers.Concatenate()([cnn, xcp])
+
+        attn = layers.Dense(64, activation='relu')(concat)
+        attn = layers.Dense(2)(attn)
+        attn = layers.Softmax()(attn)
+
+        alpha = layers.Lambda(lambda x: tf.expand_dims(x[:,0], -1))(attn)
+        beta  = layers.Lambda(lambda x: tf.expand_dims(x[:,1], -1))(attn)
+
+        cnn_weighted = layers.Multiply()([cnn, alpha])
+        xcp_weighted = layers.Multiply()([xcp, beta])
+
+        fused = layers.Add()([cnn_weighted, xcp_weighted])
+
+        # ======================================
+        # 🔥 Reshape for CBAM
+        # ======================================
+        fused = layers.Reshape((16, 8, 1))(fused)
+
+        fused = self.cbam_block(fused)
+
+        fused = layers.GlobalAveragePooling2D()(fused)
+
+        # ======================================
+        # Classifier
+        # ======================================
+        x = layers.Dense(256, activation='relu')(fused)
+        x = layers.Dropout(0.5)(x)
+        output = layers.Dense(self.num_classes, activation='softmax')(x)
+
+        model = models.Model(input_tensor, output)
+
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(1e-4),
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
+
+        self.models["Hybrid_Attention_CBAM"] = model
+
+    # ======================================
+    # Training
+    # ======================================
+    def train(self, train_ds, val_ds):
+
+        callback = tf.keras.callbacks.EarlyStopping(
+            monitor='val_accuracy', patience=3, restore_best_weights=True
+        )
+
+        for name, model in self.models.items():
+            print(f"\n🚀 Training {name}")
+            model.fit(train_ds, validation_data=val_ds,
+                      epochs=EPOCHS, callbacks=[callback])
+
+    # ======================================
+    # Evaluation
+    # ======================================
+    def evaluate(self, val_ds):
+
+        val_images, val_labels = [], []
+        for x,y in val_ds:
+            val_images.append(x)
+            val_labels.append(y)
+
+        val_images = tf.concat(val_images, axis=0)
+        val_labels = tf.concat(val_labels, axis=0)
+        true = np.argmax(val_labels, axis=1)
+
+        for name, model in self.models.items():
+            preds = np.argmax(model.predict(val_images), axis=1)
+
+            print(f"\n📊 {name}")
+            print(classification_report(true, preds, target_names=self.class_names))
+
+            print("Accuracy:", accuracy_score(true, preds))
+            print("Precision:", precision_score(true, preds, average='weighted'))
+            print("Recall:", recall_score(true, preds, average='weighted'))
+            print("F1:", f1_score(true, preds, average='weighted'))
+
+# ======================================
+# 3. Run
+# ======================================
+detector = RiceDiseaseDetector()
+
+train_ds, val_ds = detector.load_dataset()
+
+detector.build_model()
+detector.train(train_ds, val_ds)
+detector.evaluate(val_ds)
